@@ -20,9 +20,9 @@ st.set_page_config(page_title="PV + battery sizing", layout="wide")
 DEFAULT_TIERS = [(10, 150), (20, 140), (100, 130), (1000, 120)]
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=4)
 def load_bytes(data: bytes, kind: str) -> pd.DataFrame:
-    """load_res needs a path, so write the upload to a temporary file first."""
+    """Load one RES file. Only the result table is cached, and only a few profiles are kept."""
     fd, path = tempfile.mkstemp(suffix=".mat")
     with os.fdopen(fd, "wb") as f:
         f.write(data)
@@ -32,14 +32,20 @@ def load_bytes(data: bytes, kind: str) -> pd.DataFrame:
         os.remove(path)
 
 
-def collect(files, kind):
-    """Map profile name -> results, from uploaded files named RES_<profile>.mat."""
+def upload_map(files):
+    """Map profile name -> uploaded file, from files named RES_<profile>.mat. Nothing is loaded yet."""
     out = {}
     for f in files or []:
         name = os.path.splitext(f.name)[0]
         if name.startswith("RES_") and name[4:] in PROFILES:
-            out[name[4:]] = load_bytes(f.getvalue(), kind)
+            out[name[4:]] = f
     return out
+
+
+def get_df(file_map, prof, kind):
+    """Load the results for one profile on demand, or return None if it wasn't uploaded."""
+    f = file_map.get(prof)
+    return None if f is None else load_bytes(f.getvalue(), kind)
 
 
 # ---------------------------------------------------------------- sidebar
@@ -47,8 +53,8 @@ with st.sidebar:
     st.header("Data")
     pv_files = st.file_uploader("PV-only results (RES_*.mat)", type="mat", accept_multiple_files=True)
     batt_files = st.file_uploader("PV + battery results (RES_*.mat)", type="mat", accept_multiple_files=True)
-    pv_data = collect(pv_files, "pv")
-    batt_data = collect(batt_files, "batt")
+    pv_data = upload_map(pv_files)
+    batt_data = upload_map(batt_files)
 
     st.header("Economics")
     cost_cur = st.number_input("Electricity price [€/kWh]", value=0.33, step=0.01)
@@ -99,7 +105,8 @@ tab_results, tab_sens, tab_orient, tab_report = st.tabs(
 
 with tab_results:
     prof = st.selectbox("Load profile", available, key="res_prof")
-    pv_df, bt_df = pv_data.get(prof), batt_data.get(prof)
+    pv_df = get_df(pv_data, prof, "pv")
+    bt_df = get_df(batt_data, prof, "batt")
 
     cols = st.columns(2)
     for col, label, kind, df in [(cols[0], "PV only", "pv", pv_df),
@@ -163,9 +170,8 @@ with tab_sens:
     _, field, scale, batt_only = next(s for s in SWEEP_PARAMS if s[0] == param_label)
     case = st.radio("Case", ["PV only", "PV + battery"], horizontal=True, key="sens_case")
     kind = "batt" if case == "PV + battery" else "pv"
-    df = bt_df if kind == "batt" else pv_df
     sprof = st.selectbox("Load profile", available, key="sens_prof")
-    df = batt_data.get(sprof) if kind == "batt" else pv_data.get(sprof)
+    df = get_df(batt_data if kind == "batt" else pv_data, sprof, kind)
 
     base = getattr(e, field) * scale
     c1, c2, c3 = st.columns(3)
@@ -198,8 +204,8 @@ with tab_sens:
     st.subheader("Tornado")
     pct = st.number_input("Change ±%", value=20.0, step=5.0)
     if st.button("Run tornado (both cases)"):
-        for case_name, k, src in (("PV only", "pv", pv_data.get(sprof)),
-                                  ("PV + battery", "batt", batt_data.get(sprof))):
+        for case_name, k, src in (("PV only", "pv", get_df(pv_data, sprof, "pv")),
+                                  ("PV + battery", "batt", get_df(batt_data, sprof, "batt"))):
             if src is None:
                 continue
             t, base_opt = tornado(src, k, e, pct / 100)
@@ -212,7 +218,7 @@ with tab_orient:
     oprof = st.selectbox("Load profile", available, key="or_prof")
     ocase = st.radio("Case", ["PV only", "PV + battery"], horizontal=True, key="or_case")
     okind = "batt" if ocase == "PV + battery" else "pv"
-    odf = batt_data.get(oprof) if okind == "batt" else pv_data.get(oprof)
+    odf = get_df(batt_data if okind == "batt" else pv_data, oprof, okind)
     if odf is None:
         st.info("No file uploaded for this profile and case.")
     else:
@@ -236,10 +242,16 @@ with tab_orient:
         plt.close(fig)
 
 with tab_report:
-    report = pd.concat([full_report(p, pv_data.get(p), batt_data.get(p), e)
-                        for p in available], ignore_index=True)
-    show = report[["Profile", "Case", "PV [kWp]", "Battery [kWh]", "Total EAC [€/y]",
-                   "Gain vs without PV/battery [€/y]", "PV subsidy [€]", "Battery subsidy [€]"]]
-    st.dataframe(show.round(1), hide_index=True)
-    st.download_button("Download full report (CSV)", report.to_csv(index=False),
-                       file_name="full_report.csv", mime="text/csv")
+    st.write("Builds the report one profile at a time, so only one profile is in memory at once.")
+    if st.button("Build full report (all profiles)"):
+        rows = []
+        bar = st.progress(0.0)
+        for k, p in enumerate(available):
+            rows.append(full_report(p, get_df(pv_data, p, "pv"), get_df(batt_data, p, "batt"), e))
+            bar.progress((k + 1) / len(available))
+        report = pd.concat(rows, ignore_index=True)
+        show = report[["Profile", "Case", "PV [kWp]", "Battery [kWh]", "Total EAC [€/y]",
+                       "Gain vs without PV/battery [€/y]", "PV subsidy [€]", "Battery subsidy [€]"]]
+        st.dataframe(show.round(1), hide_index=True)
+        st.download_button("Download full report (CSV)", report.to_csv(index=False),
+                           file_name="full_report.csv", mime="text/csv")
