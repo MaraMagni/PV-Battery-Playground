@@ -481,7 +481,7 @@ with tab_sens:
         sprof = st.selectbox("Lastprofil", available, key="sens_profile")
         case = st.radio("Fall", ["Nur PV", "PV + Batterie"], key="sens_case")
         param = st.selectbox("Ein-Parameter-Variation", [s[1] for s in SENS], key="sens_param")
-        _, field, scale, batt_only = next(s for s in SENS if s[1] == param)
+        field, _, scale, batt_only = next(s for s in SENS if s[1] == param)
         base_val = getattr(e, field) * scale
         lo = st.number_input("Von", value=float(round(base_val * 0.5, 4)), key=f"lo_{field}")
         hi = st.number_input("Bis", value=float(round(base_val * 1.5, 4)), key=f"hi_{field}")
