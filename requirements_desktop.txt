@@ -1,0 +1,6 @@
+numpy
+pandas
+scipy
+matplotlib
+openpyxl
+h5py   # only if a RES file is MATLAB v7.3
