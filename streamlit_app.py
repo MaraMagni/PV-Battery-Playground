@@ -4,6 +4,7 @@ Gleicher Aufbau wie die Desktop-Anwendung: Eingaben und Aktionen in der Seitenle
 Ergebnisse im Hauptbereich, die übrigen Fenster als Reiter. Die Ergebnisse werden aus
 den Ordnern RES_profiles_small und RES_profiles_battery_small im Repository gelesen.
 """
+import re
 import textwrap
 from dataclasses import replace
 from pathlib import Path
@@ -82,6 +83,13 @@ def get_df(folder: Path, prof: str, kind: str):
 def show_fig(fig):
     st.pyplot(fig)
     plt.close(fig)
+
+
+def de(text: str) -> str:
+    """Zahlen im deutschen Format schreiben: 1,234.5 wird 1.234,5 (Kommas zwischen Wörtern bleiben)."""
+    text = re.sub(r"(?<=\d),(?=\d{3})", "\x00", text)
+    text = re.sub(r"(?<=\d)\.(?=\d)", ",", text)
+    return text.replace("\x00", ".")
 
 
 def ow_index(b):
@@ -220,7 +228,7 @@ def render_main(e, prof):
     if "pv" in best and "batt" in best:
         gain = best["batt"]["EAC_total"] - best["pv"]["EAC_total"]
         lines.append(f"Gewinn durch die Batterie: {gain:,.0f} €/a")
-    st.code("\n".join(lines))
+    st.code(de("\n".join(lines)))
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     if "pv" in outs:
@@ -284,9 +292,9 @@ def render_orientation(df, kind, prof, case, bin_kwp, e):
     mix = best_mix_vs_size(df, kind, e, bin_kwp)
     grid = roof_ew_grid(df, kind, e, base)
     areas = {DE[lbl]: base[c] * e.eta_pv for c, lbl in SURFACES}
-    st.code(f"{prof} | {case} | Optimum {base['kWp']:.2f} kWp, Batterie {base['kWh']:.1f} kWh, "
-            f"EAC {base['EAC_total']:,.0f} €/a\n"
-            "Optimale kWp je Fläche: " + ", ".join(f"{k} {v:.2f}" for k, v in areas.items()))
+    st.code(de(f"{prof} | {case} | Optimum {base['kWp']:.2f} kWp, Batterie {base['kWh']:.1f} kWh, "
+               f"EAC {base['EAC_total']:,.0f} €/a\n"
+               "Optimale kWp je Fläche: " + ", ".join(f"{k} {v:.2f}" for k, v in areas.items())))
 
     fig, axs = plt.subplots(2, 2, figsize=(12, 9))
     ax1, ax2, ax3, ax4 = axs.ravel()
@@ -425,8 +433,8 @@ def render_graphic(kind_name, prof, e, target, tol):
         ax2.set_title(f"Höhenlinien; weiße Punkte: innerhalb 1 % des Optimums ({tol_eur:.0f} €/a)")
         fig.tight_layout()
         show_fig(fig)
-        st.code(f"{prof}: Optimum {kwp_v[i]:.2f} kWp, {kwh_v[j]:g} kWh, EAC {best:,.0f} €/a. "
-                f"Raster: {len(kwp_v)} PV-Größen × {len(kwh_v)} Batteriegrößen.")
+        st.code(de(f"{prof}: Optimum {kwp_v[i]:.2f} kWp, {kwh_v[j]:g} kWh, EAC {best:,.0f} €/a. "
+                   f"Raster: {len(kwp_v)} PV-Größen × {len(kwh_v)} Batteriegrößen."))
 
     else:  # Ausrichtungsstreuung
         df = get_df(PV_DIR, prof, "pv")
@@ -561,8 +569,8 @@ with tab_sens:
                 st.warning("Keine Ergebnisdateien für dieses Lastprofil.")
             for case_name, k, base, t, levels, curves in results:
                 bat_txt = f", Batterie {base['kWh']:.1f} kWh" if k == "batt" else ""
-                st.markdown(f"**{case_name}**: Basis-EAC {base['EAC_total']:,.0f} €/a, "
-                            f"PV {base['kWp']:.2f} kWp{bat_txt}")
+                st.markdown(de(f"**{case_name}**: Basis-EAC {base['EAC_total']:,.0f} €/a, "
+                               f"PV {base['kWp']:.2f} kWp{bat_txt}"))
                 cols = ["Parameter", "Spannweite [€/a]", f"Δ bei −{pct:g} % [€/a]",
                         f"Δ bei +{pct:g} % [€/a]", f"PV bei −{pct:g} % [kWp]", f"PV bei +{pct:g} % [kWp]"]
                 if k == "batt":
