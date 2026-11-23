@@ -1,11 +1,10 @@
-"""PV + battery sizing: web version of the desktop app.
+"""PV- und Batterie-Dimensionierung: Web-Version der Desktop-Anwendung.
 
-Same layout as the desktop app: inputs and actions in the sidebar, results in
-the main area, and the other windows as tabs. The results are read from the
-RES_profiles_small and RES_profiles_battery_small folders in this repository.
+Gleicher Aufbau wie die Desktop-Anwendung: Eingaben und Aktionen in der Seitenleiste,
+Ergebnisse im Hauptbereich, die übrigen Fenster als Reiter. Die Ergebnisse werden aus
+den Ordnern RES_profiles_small und RES_profiles_battery_small im Repository gelesen.
 """
-import io
-import tempfile
+import textwrap
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,19 +12,39 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers the 3-D projection)
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registriert die 3-D-Projektion)
 
-from econ_core import (PROFILES, SURFACES, SWEEP_PARAMS, Economics, allocation_table,
-                       best_mix_vs_size, daily_profile, envelope, evaluate, full_report,
-                       landscape_grid, load_appl_profile, load_res, optimum, optimum_fast,
-                       orientation_scatter_table, pv_incentive, roof_ew_grid,
-                       sensitivity_1d, threshold_note, tornado)
+from econ_core import (PROFILES, SURFACES, Economics, _scale_field, allocation_table,
+                       best_mix_vs_size, envelope, evaluate, full_report, landscape_grid,
+                       load_res, optimum_fast, orientation_scatter_table, pv_incentive,
+                       roof_ew_grid, sensitivity_1d)
 
-st.set_page_config(page_title="PV + battery sizing", layout="wide")
+st.set_page_config(page_title="PV- und Batterie-Dimensionierung", layout="wide")
 
 HERE = Path(__file__).parent
 PV_DIR = HERE / "RES_profiles_small"
 BATT_DIR = HERE / "RES_profiles_battery_small"
+
+# Bezeichnungen der Flächen (intern englisch, Anzeige deutsch)
+DE = {"Balcony": "Balkon", "Roof east": "Dach Ost", "Roof west": "Dach West",
+      "Flat roof east": "Flachdach Ost", "Flat roof west": "Flachdach West"}
+REGEL_DE = {"whole": "Gesamtanlage", "marginal": "anteilig"}
+
+# Ein-Parameter-Variation (Feld, Bezeichnung, Anzeigefaktor, nur mit Batterie)
+SENS = [
+    ("cost_cur", "Strompreis [€/kWh]", 1.0, False),
+    ("gain_sell", "Einspeisevergütung [€/kWh]", 1.0, False),
+    ("r", "Diskontsatz [%]", 100.0, False),
+    ("eta_pv", "PV-Wirkungsgrad [-]", 1.0, False),
+    ("inv_pv", "PV-Investition [€/kWp]", 1.0, False),
+    ("life_pv", "PV-Lebensdauer [a]", 1.0, False),
+    ("land_pv_rate", "Landesförderung PV [€/kWp]", 1.0, False),
+    ("inv_batt", "Batterie-Investition [€/kWh]", 1.0, True),
+    ("life_batt", "Batterie-Lebensdauer [a]", 1.0, True),
+    ("bund_batt_rate", "Bundesförderung Batterie [€/kWh]", 1.0, True),
+]
+# Tornado: dieselben Parameter plus alle Bundesstufen zusammen
+TORN = [(f, lbl, b) for f, lbl, _, b in SENS] + [("bund_pv_rates", "Bundesförderung PV, alle Stufen [€/kWp]", False)]
 
 DEFAULT_TIERS = [(10, 150), (20, 140), (100, 130), (1000, 120)]
 DEFAULTS = {
@@ -48,23 +67,12 @@ def reset_inputs():
 
 @st.cache_data(show_spinner=False, max_entries=4)
 def load_case(path: str, kind: str, mtime: float) -> pd.DataFrame:
-    """Load one RES file. The mtime argument refreshes the cache when a file changes."""
+    """Lädt eine Ergebnisdatei. Der mtime-Wert aktualisiert den Cache, wenn sich die Datei ändert."""
     return load_res(path, kind)
 
 
-@st.cache_data(show_spinner=False)
-def load_appl(data: bytes, name: str) -> np.ndarray:
-    fd, path = tempfile.mkstemp(suffix=".mat")
-    with open(fd, "wb") as f:
-        f.write(data)
-    try:
-        return load_appl_profile(path, name)
-    finally:
-        Path(path).unlink(missing_ok=True)
-
-
 def get_df(folder: Path, prof: str, kind: str):
-    """Results for one profile and case, or None if the file is not in the folder."""
+    """Ergebnisse für ein Lastprofil und einen Fall, oder None, wenn die Datei fehlt."""
     path = folder / f"RES_{prof}.mat"
     if not path.exists():
         return None
@@ -76,50 +84,99 @@ def show_fig(fig):
     plt.close(fig)
 
 
-# ---------------------------------------------------------------- sidebar
+def ow_index(b):
+    """Ausrichtungsindex Dach: −1 = nur West, +1 = nur Ost."""
+    roof = b["A_RE"] + b["A_RW"]
+    return (b["A_RE"] - b["A_RW"]) / roof if roof > 0 else float("nan")
+
+
+def schwelle_hinweis(kwp, e, tol=1.0):
+    """Warnung, wenn das Optimum knapp unter einer Bundes-Förderstufe liegt (nur Regel 'Gesamtanlage')."""
+    if e.bund_pv_mode != "whole":
+        return None
+    for t in e.bund_pv_upper:
+        gap = t - kwp
+        if 0 <= gap <= tol:
+            return (f"Das Optimum {kwp:.2f} kWp liegt {gap:.2f} kWp unter der Bundes-Förderstufe "
+                    f"von {t:g} kWp. Prüfen, ob das Raster zu grob ist, um die beste Auslegung "
+                    f"knapp unter oder an der Grenze zu zeigen.")
+    return None
+
+
+def tornado_de(df, kind, e, pct):
+    """Optimum bei −pct, −pct/2, 0, +pct/2 und +pct % Änderung je Eingabe (jeweils einzeln)."""
+    levels = [-pct, -pct / 2, 0.0, pct / 2, pct]
+    base = optimum_fast(df, kind, e)
+    rows, curves = [], {}
+    for field, label, batt_only in TORN:
+        if batt_only and kind == "pv":
+            continue
+        opts = [base if lv == 0 else optimum_fast(df, kind, _scale_field(e, field, 1 + lv / 100))
+                for lv in levels]
+        lo, hi = opts[0], opts[-1]
+        curves[label] = [o["EAC_total"] for o in opts]
+        rows.append({
+            "Parameter": label,
+            f"EAC bei −{pct:g} % [€/a]": lo["EAC_total"],
+            f"EAC bei +{pct:g} % [€/a]": hi["EAC_total"],
+            f"Δ bei −{pct:g} % [€/a]": lo["EAC_total"] - base["EAC_total"],
+            f"Δ bei +{pct:g} % [€/a]": hi["EAC_total"] - base["EAC_total"],
+            "Spannweite [€/a]": abs(hi["EAC_total"] - lo["EAC_total"]),
+            f"PV bei −{pct:g} % [kWp]": lo["kWp"],
+            f"PV bei +{pct:g} % [kWp]": hi["kWp"],
+            f"Batterie bei −{pct:g} % [kWh]": lo["kWh"],
+            f"Batterie bei +{pct:g} % [kWh]": hi["kWh"],
+        })
+    table = pd.DataFrame(rows).sort_values("Spannweite [€/a]", ascending=False, ignore_index=True)
+    return base, table, levels, curves
+
+
+# ---------------------------------------------------------------- Seitenleiste
 with st.sidebar:
-    st.header("Data")
-    st.caption("Results come from RES_profiles_small and RES_profiles_battery_small in the repository.")
+    st.header("Daten")
+    st.caption("Die Ergebnisse stammen aus den Ordnern RES_profiles_small und "
+               "RES_profiles_battery_small im Repository.")
     available = [p for p in PROFILES
                  if (PV_DIR / f"RES_{p}.mat").exists() or (BATT_DIR / f"RES_{p}.mat").exists()]
     if not available:
-        st.error("No RES files found in the data folders.")
+        st.error("Keine Ergebnisdateien in den Datenordnern gefunden.")
         st.stop()
-    profile = st.selectbox("Load profile", available, key="profile")
+    profile = st.selectbox("Lastprofil", available, key="profile")
 
-    st.header("Economics")
-    st.number_input("Electricity price [€/kWh]", step=0.01, key="cost_cur")
-    st.number_input("Feed-in tariff [€/kWh]", step=0.01, key="gain_sell")
-    st.number_input("Discount rate [%]", step=0.1, key="r")
-    st.number_input("Module efficiency [kWp/m²]", step=0.01, key="eta_pv")
-    st.number_input("PV investment [€/kWp]", step=50.0, key="inv_pv")
-    st.number_input("PV lifetime [y]", step=1, key="life_pv")
-    st.number_input("Battery investment [€/kWh]", step=25.0, key="inv_batt")
-    st.number_input("Battery lifetime [y]", step=1, key="life_batt")
+    st.header("Wirtschaft")
+    st.number_input("Strompreis [€/kWh]", step=0.01, key="cost_cur")
+    st.number_input("Einspeisevergütung [€/kWh]", step=0.01, key="gain_sell")
+    st.number_input("Diskontsatz [%]", step=0.1, key="r")
+    st.number_input("PV-Wirkungsgrad [-]", step=0.01, key="eta_pv")
+    st.number_input("PV-Investition [€/kWp]", step=50.0, key="inv_pv")
+    st.number_input("PV-Lebensdauer [a]", step=1, key="life_pv")
+    st.number_input("Batterie-Investition [€/kWh]", step=25.0, key="inv_batt")
+    st.number_input("Batterie-Lebensdauer [a]", step=1, key="life_batt")
 
-    st.header("Subsidies")
-    st.number_input("State PV rate [€/kWp]", step=5.0, key="land_pv_rate")
-    st.number_input("State PV cap [kWp]", step=1.0, key="land_pv_cap")
-    st.number_input("State battery [€/kWh]", step=10.0, key="land_batt_rate")
-    st.number_input("Federal battery [€/kWh]", step=10.0, key="bund_batt_rate")
-    st.number_input("Federal battery cap [kWh]", step=5.0, key="bund_batt_cap")
-    st.selectbox("Federal PV rule", ["whole", "marginal"], key="mode")
-    st.caption("Federal PV bands: upper bound [kWp] / rate [€/kWp]")
+    st.header("Förderung")
+    st.number_input("Landesförderung PV [€/kWp]", step=5.0, key="land_pv_rate")
+    st.number_input("Landesförderung PV, Obergrenze [kWp]", step=1.0, key="land_pv_cap")
+    st.number_input("Landesförderung Batterie [€/kWh]", step=10.0, key="land_batt_rate")
+    st.number_input("Bundesförderung Batterie [€/kWh]", step=10.0, key="bund_batt_rate")
+    st.number_input("Bundesförderung Batterie, Obergrenze [kWh]", step=5.0, key="bund_batt_cap")
+    st.selectbox("Bundesregel PV", ["whole", "marginal"], key="mode",
+                 format_func=lambda m: REGEL_DE[m])
+    st.caption("Bundesförderung PV-Stufen: Obergrenze [kWp] / Satz [€/kWp]")
     for i in range(len(DEFAULT_TIERS)):
         c1, c2 = st.columns(2)
-        c1.number_input(f"Upper {i + 1} [kWp]", key=f"up{i}")
-        c2.number_input(f"Rate {i + 1} [€/kWp]", key=f"rt{i}")
+        c1.number_input(f"Stufe {i + 1}: Obergrenze [kWp]", key=f"up{i}")
+        c2.number_input(f"Stufe {i + 1}: Satz [€/kWp]", key=f"rt{i}")
 
-    st.header("Actions")
-    run_main = st.button("Run selected profile", type="primary")
-    st.button("Reset inputs to original", on_click=reset_inputs)
-    run_report = st.button("Full report: all profiles")
+    st.header("Aktionen")
+    run_main = st.button("Ausgewähltes Lastprofil berechnen", type="primary")
+    st.button("Eingaben auf Ausgangswerte zurücksetzen", on_click=reset_inputs)
+    run_report = st.button("Vollbericht: alle Lastprofile")
 
 ss = st.session_state
 uppers = [ss[f"up{i}"] for i in range(len(DEFAULT_TIERS))]
 rates = [ss[f"rt{i}"] for i in range(len(DEFAULT_TIERS))]
 if np.any(np.diff(uppers) <= 0):
-    st.error("Federal band upper bounds must be increasing.")
+    st.error("Die Obergrenzen der Bundesstufen müssen steigen.")
     st.stop()
 
 e = Economics(
@@ -133,60 +190,62 @@ e = Economics(
 )
 
 
-# ---------------------------------------------------------------- main window
+# ---------------------------------------------------------------- Ergebnisse
 def render_main(e, prof):
     pv_df = get_df(PV_DIR, prof, "pv")
     bt_df = get_df(BATT_DIR, prof, "batt")
-    lines = [f"Profile: {prof}    Federal PV rule: {e.bund_pv_mode}", ""]
+    lines = [f"Lastprofil: {prof}    Bundesregel PV: {REGEL_DE[e.bund_pv_mode]}", ""]
     outs, best = {}, {}
-    for label, kind, df in (("PV only", "pv", pv_df), ("PV + battery", "batt", bt_df)):
+    for label, kind, df in (("Nur PV", "pv", pv_df), ("PV + Batterie", "batt", bt_df)):
         if df is None:
             continue
         outs[kind] = evaluate(df, kind, e)
         b = optimum_fast(df, kind, e)
         best[kind] = b
-        lines.append(f"{label}: PV {b['kWp']:.2f} kWp | battery {b['kWh']:.1f} kWh | "
-                     f"EAC {b['EAC_total']:,.0f} €/y | grid {b['GridDem_kWh']:,.0f} kWh/y | "
-                     f"PV subsidy {b['Incentive_PV']:,.0f} € | battery subsidy {b['Incentive_Batt']:,.0f} €")
-        split = ", ".join(f"{lbl} {b[c] * e.eta_pv:.2f} kWp" for c, lbl in SURFACES)
-        roof = b["A_RE"] + b["A_RW"]
-        ow = (b["A_RE"] - b["A_RW"]) / roof if roof > 0 else float("nan")
-        lines.append(f"  Orientation: {split} | roof O/W index {ow:+.2f}")
-        note = threshold_note(b["kWp"], e)
+        demand = b["Self_kWh"] + b["GridDem_kWh"]
+        lines += [
+            f"{label}: PV {b['kWp']:.2f} kWp | Batterie {b['kWh']:.1f} kWh | EAC {b['EAC_total']:,.0f} €/a",
+            f"  Gesamtstrombedarf {demand:,.0f} kWh/a = Eigenverbrauch {b['Self_kWh']:,.0f} "
+            f"+ Netzbezug {b['GridDem_kWh']:,.0f} kWh/a",
+            f"  Förderung PV {b['Incentive_PV']:,.0f} € | Förderung Batterie {b['Incentive_Batt']:,.0f} €",
+            "  Ausrichtung: " + ", ".join(f"{DE[lbl]} {b[c] * e.eta_pv:.2f} kWp" for c, lbl in SURFACES)
+            + f" | Ausrichtungsindex Dach O/W {ow_index(b):+.2f}",
+        ]
+        note = schwelle_hinweis(b["kWp"], e)
         if note:
-            lines.append("  WARNING: " + note)
+            lines.append("  HINWEIS: " + note)
     if not best:
-        st.warning(f"No RES file found for {prof}.")
+        st.warning(f"Keine Ergebnisdatei für {prof} gefunden.")
         return
     if "pv" in best and "batt" in best:
         gain = best["batt"]["EAC_total"] - best["pv"]["EAC_total"]
-        lines.append(f"Gain from adding a battery: {gain:,.0f} €/y")
+        lines.append(f"Gewinn durch die Batterie: {gain:,.0f} €/a")
     st.code("\n".join(lines))
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     if "pv" in outs:
         env = envelope(outs["pv"], by_battery=False)
-        ax1.plot(env["kWp_r"], env["EAC_total"], lw=1.6, label="PV only")
+        ax1.plot(env["kWp_r"], env["EAC_total"], lw=1.6, label="Nur PV")
     if "batt" in outs:
         envb = envelope(outs["batt"], by_battery=True)
         for kwh, g in envb.groupby("kWh"):
             if kwh == 0:
                 continue
             ax1.plot(g["kWp_r"], g["EAC_total"], lw=1, alpha=0.8, label=f"{kwh:g} kWh")
-    ax1.set_xlabel("Installed PV [kWp]")
-    ax1.set_ylabel("Total EAC [€/y]")
-    ax1.set_title(f"EAC vs PV size: {prof}")
+    ax1.set_xlabel("Installierte PV-Leistung [kWp]")
+    ax1.set_ylabel("Gesamtkosten EAC [€/a]")
+    ax1.set_title(f"EAC über PV-Leistung: {prof}")
     ax1.grid(True)
     ax1.legend(fontsize=7)
 
     x = np.linspace(0, 40, 801)
     other = "marginal" if e.bund_pv_mode == "whole" else "whole"
     e_other = replace(e, bund_pv_mode=other)
-    ax2.plot(x, x * e.inv_pv - pv_incentive(x, e), label=f"Net PV investment ({e.bund_pv_mode})")
-    ax2.plot(x, x * e.inv_pv - pv_incentive(x, e_other), "--", label=f"Other rule ({other})")
-    ax2.set_xlabel("Installed PV [kWp]")
-    ax2.set_ylabel("Net investment [€]")
-    ax2.set_title("Net PV investment after subsidies")
+    ax2.plot(x, x * e.inv_pv - pv_incentive(x, e), label=f"Netto-PV-Investition ({REGEL_DE[e.bund_pv_mode]})")
+    ax2.plot(x, x * e.inv_pv - pv_incentive(x, e_other), "--", label=f"Andere Regel ({REGEL_DE[other]})")
+    ax2.set_xlabel("Installierte PV-Leistung [kWp]")
+    ax2.set_ylabel("Netto-Investition [€]")
+    ax2.set_title("Netto-PV-Investition nach Förderung")
     ax2.grid(True)
     ax2.legend(fontsize=8)
     fig.tight_layout()
@@ -195,57 +254,69 @@ def render_main(e, prof):
 
 def render_report(e):
     rows = []
-    bar = st.progress(0.0, text="Building the full report")
+    bar = st.progress(0.0, text="Vollbericht wird erstellt")
     for k, p in enumerate(available):
         rows.append(full_report(p, get_df(PV_DIR, p, "pv"), get_df(BATT_DIR, p, "batt"), e))
         bar.progress((k + 1) / len(available))
     report = pd.concat(rows, ignore_index=True)
-    cols = ["Profile", "Case", "PV [kWp]", "Battery [kWh]", "Total EAC [€/y]",
-            "Gain vs without PV/battery [€/y]", "PV subsidy [€]", "Battery subsidy [€]"]
-    st.dataframe(report[cols].round(1), hide_index=True)
-    st.download_button("Save full report as CSV", report.to_csv(index=False),
-                       file_name="full_report_python.csv", mime="text/csv")
+    report["Gesamtstrombedarf [kWh/y]"] = report["Self-consumed [kWh/y]"] + report["Grid demand [kWh/y]"]
+    rename = {
+        "Profile": "Lastprofil", "Case": "Fall", "PV [kWp]": "PV [kWp]",
+        "Battery [kWh]": "Batterie [kWh]", "Total EAC [€/y]": "Gesamtkosten EAC [€/a]",
+        "Gain vs without PV/battery [€/y]": "Gewinn ggü. ohne PV/Batterie [€/a]",
+        "PV subsidy [€]": "Förderung PV [€]", "Battery subsidy [€]": "Förderung Batterie [€]",
+        "Self-consumed [kWh/y]": "Eigenverbrauch [kWh/a]", "Grid demand [kWh/y]": "Netzbezug [kWh/a]",
+        "Gesamtstrombedarf [kWh/y]": "Gesamtstrombedarf [kWh/a]",
+    }
+    show = report.rename(columns=rename)
+    show["Fall"] = show["Fall"].map({"PV only": "Nur PV", "PV + battery": "PV + Batterie"})
+    cols = ["Lastprofil", "Fall", "PV [kWp]", "Batterie [kWh]", "Gesamtkosten EAC [€/a]",
+            "Gewinn ggü. ohne PV/Batterie [€/a]", "Förderung PV [€]", "Förderung Batterie [€]",
+            "Eigenverbrauch [kWh/a]", "Netzbezug [kWh/a]", "Gesamtstrombedarf [kWh/a]"]
+    st.dataframe(show[cols].round(1), hide_index=True)
+    st.download_button("Vollbericht als CSV speichern", report.to_csv(index=False),
+                       file_name="vollbericht.csv", mime="text/csv")
 
 
-# ---------------------------------------------------------------- orientation helpers
+# ---------------------------------------------------------------- PV-Ausrichtung
 def render_orientation(df, kind, prof, case, bin_kwp, e):
     base = optimum_fast(df, kind, e)
     mix = best_mix_vs_size(df, kind, e, bin_kwp)
     grid = roof_ew_grid(df, kind, e, base)
-    areas = {lbl: base[c] * e.eta_pv for c, lbl in SURFACES}
-    st.code(f"{prof} | {case} | optimum {base['kWp']:.2f} kWp, battery {base['kWh']:.1f} kWh, "
-            f"EAC {base['EAC_total']:,.0f} €/y\n"
-            "Optimal kWp per surface: " + ", ".join(f"{k} {v:.2f}" for k, v in areas.items()))
+    areas = {DE[lbl]: base[c] * e.eta_pv for c, lbl in SURFACES}
+    st.code(f"{prof} | {case} | Optimum {base['kWp']:.2f} kWp, Batterie {base['kWh']:.1f} kWh, "
+            f"EAC {base['EAC_total']:,.0f} €/a\n"
+            "Optimale kWp je Fläche: " + ", ".join(f"{k} {v:.2f}" for k, v in areas.items()))
 
     fig, axs = plt.subplots(2, 2, figsize=(12, 9))
     ax1, ax2, ax3, ax4 = axs.ravel()
     ax1.stackplot(mix["kWp"], [mix[c] for c, _ in SURFACES],
-                  labels=[lbl for _, lbl in SURFACES], alpha=0.85)
+                  labels=[DE[lbl] for _, lbl in SURFACES], alpha=0.85)
     ax1.axvline(base["kWp"], color="k", ls="--", lw=0.8)
-    ax1.set_xlabel("Total installed PV [kWp]")
-    ax1.set_ylabel("kWp per surface")
-    ax1.set_title("Best surface allocation for each total size")
+    ax1.set_xlabel("Gesamte installierte PV-Leistung [kWp]")
+    ax1.set_ylabel("kWp je Fläche")
+    ax1.set_title("Beste Flächenverteilung je Gesamtgröße")
     ax1.legend(fontsize=7, loc="upper left")
     ax1.grid(True)
 
     ax2.plot(mix["kWp"], mix["EAC_total"], "o-", ms=3, color="tab:green")
     ax2.plot(base["kWp"], base["EAC_total"], "r*", ms=14, label="Optimum")
-    ax2.set_xlabel("Total installed PV [kWp]")
-    ax2.set_ylabel("Total EAC [€/y]")
-    ax2.set_title("Best achievable cost for each size")
+    ax2.set_xlabel("Gesamte installierte PV-Leistung [kWp]")
+    ax2.set_ylabel("Gesamtkosten EAC [€/a]")
+    ax2.set_title("Beste erreichbare Kosten je Größe")
     ax2.grid(True)
     ax2.legend()
 
     xs = grid.columns.to_numpy(dtype=float)
     ys = grid.index.to_numpy(dtype=float)
     mesh = ax3.pcolormesh(xs, ys, grid.to_numpy(), shading="nearest", cmap="viridis")
-    fig.colorbar(mesh, ax=ax3, label="Total EAC [€/y]")
+    fig.colorbar(mesh, ax=ax3, label="Gesamtkosten EAC [€/a]")
     ax3.plot(base["A_RE"] * e.eta_pv, base["A_RW"] * e.eta_pv, "r*", ms=14)
-    ax3.set_xlabel("East roof [kWp]")
-    ax3.set_ylabel("West roof [kWp]")
-    ax3.set_title("East vs west roof (other surfaces at optimum)")
+    ax3.set_xlabel("Dach Ost [kWp]")
+    ax3.set_ylabel("Dach West [kWp]")
+    ax3.set_title("Ost- vs. West-Dach (übrige Flächen im Optimum)")
 
-    ax4.set_title("Optimal allocation: all profiles (see the button in the controls)")
+    ax4.set_title("Optimale Verteilung: alle Lastprofile (Schaltfläche in der Steuerung)")
     ax4.axis("off")
     fig.tight_layout()
     show_fig(fig)
@@ -258,12 +329,12 @@ def render_all_allocation(kind, case, e):
         if df is None:
             continue
         b = optimum_fast(df, kind, e)
-        rows.append({"Profile": p, **{lbl: b[c] * e.eta_pv for c, lbl in SURFACES}})
+        rows.append({"Lastprofil": p, **{DE[lbl]: b[c] * e.eta_pv for c, lbl in SURFACES}})
     if not rows:
-        st.warning("No RES files for this case.")
+        st.warning("Keine Ergebnisdateien für diesen Fall gefunden.")
         return
-    t = pd.DataFrame(rows).set_index("Profile")
-    st.text(f"Optimal kWp per surface, all profiles ({case})")
+    t = pd.DataFrame(rows).set_index("Lastprofil")
+    st.text(f"Optimale kWp je Fläche, alle Lastprofile ({case})")
     st.dataframe(t.round(2))
     fig, ax = plt.subplots(figsize=(11, 5))
     bottom = np.zeros(len(t))
@@ -272,22 +343,22 @@ def render_all_allocation(kind, case, e):
         bottom += t[lbl].to_numpy()
     ax.set_xticks(np.arange(len(t)))
     ax.set_xticklabels(t.index, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("Optimal installed PV [kWp]")
-    ax.set_title(f"Optimal PV allocation by surface: {case}")
+    ax.set_ylabel("Optimale installierte PV [kWp]")
+    ax.set_title(f"Optimale PV-Verteilung nach Fläche: {case}")
     ax.legend(fontsize=8)
     ax.grid(True, axis="y")
     fig.tight_layout()
     show_fig(fig)
 
 
-# ---------------------------------------------------------------- report graphics
+# ---------------------------------------------------------------- Berichtsgrafiken
 def render_graphic(kind_name, prof, e, target, tol):
-    if kind_name == "Allocation: all profiles":
+    if kind_name == "Verteilung aller Lastprofile":
         parts = [allocation_table({p: (get_df(PV_DIR, p, "pv"), get_df(BATT_DIR, p, "batt"))}, e)
                  for p in available]
         t = pd.concat(parts, ignore_index=True)
         if t.empty:
-            st.warning("No RES files found.")
+            st.warning("Keine Ergebnisdateien gefunden.")
             return
         x = np.arange(len(t))
         profs = list(t["Profile"])
@@ -296,13 +367,12 @@ def render_graphic(kind_name, prof, e, target, tol):
         colors = ["#d9776b", "#f5b97f", "#c4c4c4", "#c99473", "#5f5f5f"]
         for (c, lbl), col in zip(SURFACES, colors):
             ax.bar(x, t[lbl].to_numpy(), bottom=bottom, color=col, edgecolor="k", lw=0.5,
-                   label=lbl, width=0.6)
+                   label=DE[lbl], width=0.6)
             bottom += t[lbl].to_numpy()
         ax.set_ylabel("PV [kWp]")
         ax.set_xticks(x)
         ax.set_xticklabels(list(t["Case"]), fontsize=8)
-        # Profile name underneath each pair of bars, with a separator between profiles
-        import textwrap
+        # Name des Lastprofils unter jedem Balkenpaar, mit Trennlinie zwischen den Profilen
         starts = [i for i, p in enumerate(profs) if i == 0 or profs[i - 1] != p]
         ends = starts[1:] + [len(profs)]
         for s, en in zip(starts, ends):
@@ -316,7 +386,7 @@ def render_graphic(kind_name, prof, e, target, tol):
         ax2 = ax.twinx()
         ax2.bar(x, t["kWh"].to_numpy(), width=0.6, fill=False, linestyle="--", edgecolor="k",
                 lw=1, label="E_Batt [kWh]")
-        ax2.set_ylabel("Battery [kWh]")
+        ax2.set_ylabel("Batterie [kWh]")
         h1, l1 = ax.get_legend_handles_labels()
         h2, l2 = ax2.get_legend_handles_labels()
         ax.legend(h1 + h2, l1 + l2, fontsize=8, ncol=3, loc="upper center")
@@ -325,10 +395,10 @@ def render_graphic(kind_name, prof, e, target, tol):
         show_fig(fig)
         st.dataframe(t.round(2), hide_index=True)
 
-    elif kind_name == "Battery landscape":
+    elif kind_name == "Batterie-Landschaft":
         df = get_df(BATT_DIR, prof, "batt")
         if df is None:
-            st.warning("No battery RES file for this profile.")
+            st.warning("Keine Ergebnisdatei mit Batterie für dieses Lastprofil.")
             return
         kwh_v, kwp_v, Z = landscape_grid(df, e)
         Z = np.where(np.isfinite(Z), Z, np.nanmin(Z))
@@ -340,51 +410,54 @@ def render_graphic(kind_name, prof, e, target, tol):
         ax1 = fig.add_subplot(2, 1, 1, projection="3d")
         ax1.plot_surface(BB, KK, Z / 1000, cmap="viridis", alpha=0.85, edgecolor="none")
         ax1.scatter([kwh_v[j]], [kwp_v[i]], [best / 1000], color="r", s=120, marker="*")
-        ax1.set_xlabel("Battery [kWh]")
+        ax1.set_xlabel("Batterie [kWh]")
         ax1.set_ylabel("PV [kWp]")
-        ax1.set_zlabel("EAC [k€/y]")
-        ax1.set_title(f"{prof}: EAC landscape, optimum {kwp_v[i]:.1f} kWp / {kwh_v[j]:g} kWh")
+        ax1.set_zlabel("EAC [k€/a]")
+        ax1.set_title(f"{prof}: EAC-Landschaft, Optimum {kwp_v[i]:.1f} kWp / {kwh_v[j]:g} kWh")
         ax2 = fig.add_subplot(2, 1, 2)
         cs = ax2.contourf(BB, KK, Z / 1000, 20, cmap="viridis")
-        fig.colorbar(cs, ax=ax2, label="EAC [k€/y]")
+        fig.colorbar(cs, ax=ax2, label="EAC [k€/a]")
         near = Z > best - tol_eur
         ax2.plot(BB[near], KK[near], "w.", ms=6)
         ax2.plot(kwh_v[j], kwp_v[i], "r*", ms=16)
-        ax2.set_xlabel("Battery [kWh]")
+        ax2.set_xlabel("Batterie [kWh]")
         ax2.set_ylabel("PV [kWp]")
-        ax2.set_title(f"Contour; white dots within 1% of the optimum ({tol_eur:.0f} €/y)")
+        ax2.set_title(f"Höhenlinien; weiße Punkte: innerhalb 1 % des Optimums ({tol_eur:.0f} €/a)")
         fig.tight_layout()
         show_fig(fig)
-        st.code(f"{prof}: optimum {kwp_v[i]:.2f} kWp, {kwh_v[j]:g} kWh, EAC {best:,.0f} €/y. "
-                f"Grid: {len(kwp_v)} PV sizes × {len(kwh_v)} battery sizes.")
+        st.code(f"{prof}: Optimum {kwp_v[i]:.2f} kWp, {kwh_v[j]:g} kWh, EAC {best:,.0f} €/a. "
+                f"Raster: {len(kwp_v)} PV-Größen × {len(kwh_v)} Batteriegrößen.")
 
-    elif kind_name == "Orientation scatter":
+    else:  # Ausrichtungsstreuung
         df = get_df(PV_DIR, prof, "pv")
         if df is None:
-            st.warning("No PV-only RES file for this profile.")
+            st.warning("Keine Ergebnisdatei ohne Batterie für dieses Lastprofil.")
             return
         t = orientation_scatter_table(df, e, target, tol)
         if t.empty:
-            st.warning("No designs near this size. Increase the tolerance.")
+            st.warning("Keine Auslegungen in dieser Größe. Toleranz erhöhen.")
             return
-        cols = ["PV yield [kWh/y]", "Self-consumption [%]", "PV to grid [kWh/y]",
-                "Grid demand [kWh/y]", "EAC [€/y]"]
+        cols = {"PV yield [kWh/y]": "PV-Ertrag [kWh/a]",
+                "Self-consumption [%]": "Eigenverbrauch [%]",
+                "PV to grid [kWh/y]": "Einspeisung [kWh/a]",
+                "Grid demand [kWh/y]": "Netzbezug [kWh/a]",
+                "EAC [€/y]": "EAC [€/a]"}
         fig, axes = plt.subplots(len(cols), 1, figsize=(10, 14), sharex=True)
-        for ax, col in zip(axes, cols):
+        for ax, (col, label) in zip(axes, cols.items()):
             sc = ax.scatter(t["OW"], t[col], c=100 * t["Balcony share"], cmap="viridis", s=22)
-            ax.set_ylabel(col, fontsize=8)
+            ax.set_ylabel(label, fontsize=8)
             ax.grid(True, alpha=0.4)
-            fig.colorbar(sc, ax=ax, label="Balcony share [%]")
-        axes[-1].set_xlabel("Roof O/W  (−1 = west, +1 = east)")
-        fig.suptitle(f"{prof}: designs near {target:g} kWp (±{tol:g}), n = {len(t)}")
+            fig.colorbar(sc, ax=ax, label="Balkonanteil [%]")
+        axes[-1].set_xlabel("Ausrichtungsindex Dach (−1 = West, +1 = Ost)")
+        fig.suptitle(f"{prof}: Auslegungen nahe {target:g} kWp (±{tol:g}), n = {len(t)}")
         fig.tight_layout()
         show_fig(fig)
-        st.code("Roof-only orientation index; balcony share colour. Rows with no roof are excluded.")
+        st.code("Ausrichtungsindex nur Dachflächen; Farbe = Balkonanteil. Zeilen ohne Dach sind ausgeschlossen.")
 
 
-# ---------------------------------------------------------------- tabs
+# ---------------------------------------------------------------- Reiter
 tab_main, tab_sens, tab_orient, tab_graph = st.tabs(
-    ["Results", "Sensitivity", "PV orientation", "Report graphics"])
+    ["Ergebnisse", "Sensitivität", "PV-Ausrichtung", "Berichtsgrafiken"])
 
 with tab_main:
     if run_main:
@@ -397,73 +470,80 @@ with tab_main:
 with tab_sens:
     ctrl, out = st.columns([1, 3])
     with ctrl:
-        sprof = st.selectbox("Profile", available, key="sens_profile")
-        case = st.radio("Case", ["PV only", "PV + battery"], key="sens_case")
-        param = st.selectbox("One-parameter sweep", [s[0] for s in SWEEP_PARAMS], key="sens_param")
-        _, field, scale, batt_only = next(s for s in SWEEP_PARAMS if s[0] == param)
-        base = getattr(e, field) * scale
-        lo = st.number_input("From", value=float(round(base * 0.5, 4)), key=f"lo_{field}")
-        hi = st.number_input("To", value=float(round(base * 1.5, 4)), key=f"hi_{field}")
-        steps = st.number_input("Steps", value=9, min_value=2, step=1, key="sens_steps")
-        run_sweep = st.button("Run sweep")
+        sprof = st.selectbox("Lastprofil", available, key="sens_profile")
+        case = st.radio("Fall", ["Nur PV", "PV + Batterie"], key="sens_case")
+        param = st.selectbox("Ein-Parameter-Variation", [s[1] for s in SENS], key="sens_param")
+        _, field, scale, batt_only = next(s for s in SENS if s[1] == param)
+        base_val = getattr(e, field) * scale
+        lo = st.number_input("Von", value=float(round(base_val * 0.5, 4)), key=f"lo_{field}")
+        hi = st.number_input("Bis", value=float(round(base_val * 1.5, 4)), key=f"hi_{field}")
+        steps = st.number_input("Schritte", value=9, min_value=2, step=1, key="sens_steps")
+        run_sweep = st.button("Variation berechnen")
         st.divider()
-        pct = st.number_input("Change ±%", value=20.0, step=5.0, key="sens_pct")
-        run_tornado = st.button("Run tornado (both cases)")
+        pct = st.number_input("Änderung ±%", value=20.0, step=5.0, key="sens_pct")
+        run_tornado = st.button("Tornado berechnen (beide Fälle)")
 
     with out:
-        kind = "batt" if case == "PV + battery" else "pv"
+        kind = "batt" if case == "PV + Batterie" else "pv"
         if run_sweep:
             df = get_df(BATT_DIR if kind == "batt" else PV_DIR, sprof, kind)
             if df is None:
-                st.warning("No RES file for this profile and case.")
+                st.warning("Keine Ergebnisdatei für dieses Lastprofil und diesen Fall.")
             elif batt_only and kind == "pv":
-                st.info("This parameter only affects the PV + battery case. Choose that case.")
+                st.info("Dieser Parameter wirkt nur auf den Fall PV + Batterie. Diesen Fall wählen.")
             else:
                 table = sensitivity_1d(df, kind, e, field,
                                        np.linspace(lo / scale, hi / scale, int(steps)))
                 table.insert(0, param, table["value"] * scale)
-                for c, lbl in SURFACES:  # kWp per surface of each optimum
-                    table[f"{lbl} [kWp]"] = table[c] * e.eta_pv
-                surf_cols = [f"{lbl} [kWp]" for _, lbl in SURFACES]
-                show = table[[param, "kWp", "kWh", "EAC_total", "GridDem_kWh",
-                              "Incentive_PV", "Incentive_Batt"] + surf_cols]
-                st.text(f"{sprof} | {case} | sweep of {param}")
-                st.dataframe(show.round(2), hide_index=True)
-                st.download_button("Save table as CSV",
-                                   table.assign(Profile=sprof, Case=case).to_csv(index=False),
-                                   file_name="sensitivity.csv", mime="text/csv")
+                disp = pd.DataFrame({
+                    param: table[param],
+                    "PV [kWp]": table["kWp"],
+                    "Batterie [kWh]": table["kWh"],
+                    "Gesamtkosten EAC [€/a]": table["EAC_total"],
+                    "Netzbezug [kWh/a]": table["GridDem_kWh"],
+                    "Gesamtstrombedarf [kWh/a]": table["Self_kWh"] + table["GridDem_kWh"],
+                    "Förderung PV [€]": table["Incentive_PV"],
+                    "Förderung Batterie [€]": table["Incentive_Batt"],
+                })
+                for c, lbl in SURFACES:
+                    disp[f"{DE[lbl]} [kWp]"] = table[c].to_numpy() * e.eta_pv
+                st.text(f"{sprof} | {case} | Variation von {param}")
+                st.dataframe(disp.round(2), hide_index=True)
+                st.download_button("Tabelle als CSV speichern",
+                                   table.assign(Lastprofil=sprof, Fall=case).to_csv(index=False),
+                                   file_name="sensitivitaet.csv", mime="text/csv")
                 fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.5))
                 a1.plot(table[param], table["kWp"], "o-", label="PV [kWp]")
                 if kind == "batt":
-                    a1.plot(table[param], table["kWh"], "s--", label="Battery [kWh]")
+                    a1.plot(table[param], table["kWh"], "s--", label="Batterie [kWh]")
                 a1.set_xlabel(param)
-                a1.set_ylabel("Optimal size")
+                a1.set_ylabel("Optimale Größe")
                 a1.grid(True)
                 a1.legend()
                 a2.plot(table[param], table["EAC_total"], "o-", color="tab:green")
                 a2.set_xlabel(param)
-                a2.set_ylabel("Optimal total EAC [€/y]")
-                a2.set_title("Optimal annual cost")
+                a2.set_ylabel("Optimale Gesamtkosten EAC [€/a]")
+                a2.set_title("Optimale jährliche Kosten")
                 a2.grid(True)
                 fig.tight_layout()
                 show_fig(fig)
 
-                # Optimal PV per surface for each sweep value, stacked like the allocation diagram
+                # Optimale PV je Fläche für jeden Wert, gestapelt wie im Flächendiagramm
                 fig2, ax3 = plt.subplots(figsize=(11, 4.5))
                 x = np.arange(len(table))
                 bottom = np.zeros(len(table))
                 colors = ["#d9776b", "#f5b97f", "#c4c4c4", "#c99473", "#5f5f5f"]
-                for (_, lbl), col in zip(SURFACES, colors):
-                    vals = table[f"{lbl} [kWp]"].to_numpy()
+                for (c, lbl), col in zip(SURFACES, colors):
+                    vals = disp[f"{DE[lbl]} [kWp]"].to_numpy()
                     ax3.bar(x, vals, bottom=bottom, color=col, edgecolor="k", lw=0.4,
-                            width=0.7, label=lbl)
+                            width=0.7, label=DE[lbl])
                     bottom += vals
-                ax3.plot(x, table["kWp"].to_numpy(), "k_", ms=22, mew=2, label="Total PV [kWp]")
+                ax3.plot(x, table["kWp"].to_numpy(), "k_", ms=22, mew=2, label="PV gesamt [kWp]")
                 ax3.set_xticks(x)
                 ax3.set_xticklabels([f"{v:.3g}" for v in table[param]], rotation=45, ha="right")
                 ax3.set_xlabel(param)
-                ax3.set_ylabel("Optimal PV per surface [kWp]")
-                ax3.set_title(f"Optimal PV allocation by surface: {sprof} | {case}")
+                ax3.set_ylabel("Optimale PV je Fläche [kWp]")
+                ax3.set_title(f"Optimale PV-Verteilung nach Fläche: {sprof} | {case}")
                 ax3.legend(fontsize=8, loc="upper left")
                 ax3.grid(True, axis="y", alpha=0.4)
                 fig2.tight_layout()
@@ -471,50 +551,65 @@ with tab_sens:
 
         if run_tornado:
             results = []
-            for case_name, k, folder in (("PV only", "pv", PV_DIR),
-                                         ("PV + battery", "batt", BATT_DIR)):
+            for case_name, k, folder in (("Nur PV", "pv", PV_DIR), ("PV + Batterie", "batt", BATT_DIR)):
                 src = get_df(folder, sprof, k)
                 if src is None:
                     continue
-                t, base_opt = tornado(src, k, e, pct / 100)
-                results.append((case_name, t, base_opt))
+                base, t, levels, curves = tornado_de(src, k, e, pct)
+                results.append((case_name, k, base, t, levels, curves))
             if not results:
-                st.warning("No RES files for this profile.")
-            for case_name, t, base_opt in results:
-                st.write(f"**{case_name}**: baseline EAC {base_opt['EAC_total']:,.0f} €/y, "
-                         f"PV {base_opt['kWp']:.2f} kWp, battery {base_opt['kWh']:.1f} kWh")
-                cols = ["Parameter", "Swing [€/y]", "Δ low [€/y]", "Δ high [€/y]", "kWp low", "kWp high"]
-                if case_name == "PV + battery":
-                    cols += ["kWh low", "kWh high"]
+                st.warning("Keine Ergebnisdateien für dieses Lastprofil.")
+            for case_name, k, base, t, levels, curves in results:
+                bat_txt = f", Batterie {base['kWh']:.1f} kWh" if k == "batt" else ""
+                st.markdown(f"**{case_name}**: Basis-EAC {base['EAC_total']:,.0f} €/a, "
+                            f"PV {base['kWp']:.2f} kWp{bat_txt}")
+                cols = ["Parameter", "Spannweite [€/a]", f"Δ bei −{pct:g} % [€/a]",
+                        f"Δ bei +{pct:g} % [€/a]", f"PV bei −{pct:g} % [kWp]", f"PV bei +{pct:g} % [kWp]"]
+                if k == "batt":
+                    cols += [f"Batterie bei −{pct:g} % [kWh]", f"Batterie bei +{pct:g} % [kWh]"]
                 st.dataframe(t[cols].round(1), hide_index=True)
-            if results:
-                fig, axes = plt.subplots(1, len(results), figsize=(6 * len(results), 5), squeeze=False)
-                for ax, (case_name, t, _) in zip(axes[0], results):
-                    y = np.arange(len(t))
-                    ax.hlines(y, t["Δ low [€/y]"], t["Δ high [€/y]"], linewidth=8, color="tab:blue")
-                    ax.axvline(0, color="k", lw=0.8)
-                    ax.set_yticks(y)
-                    ax.set_yticklabels(t["Parameter"], fontsize=8)
-                    ax.invert_yaxis()
-                    ax.set_xlabel(f"Change in optimal EAC [€/y] ({case_name})")
-                    ax.grid(True, axis="x")
+
+                # Balkendiagramm: Änderung der EAC je Eingabe
+                fig, ax = plt.subplots(figsize=(10, 5))
+                y = np.arange(len(t))
+                ax.hlines(y, t[f"Δ bei −{pct:g} % [€/a]"], t[f"Δ bei +{pct:g} % [€/a]"],
+                          linewidth=8, color="tab:blue")
+                ax.axvline(0, color="k", lw=0.8)
+                ax.set_yticks(y)
+                ax.set_yticklabels(t["Parameter"], fontsize=8)
+                ax.invert_yaxis()
+                ax.set_xlabel(f"Änderung der optimalen EAC [€/a] ({case_name})")
+                ax.grid(True, axis="x")
+                fig.tight_layout()
+                show_fig(fig)
+
+                # Liniendiagramm: EAC über die Änderung der Eingabe, eine Linie je Eingabe
+                fig, ax = plt.subplots(figsize=(11, 5.5))
+                for label in t["Parameter"]:
+                    ax.plot(levels, curves[label], "o-", ms=4, label=label)
+                ax.axvline(0, color="k", lw=0.8)
+                ax.set_xlabel("Änderung der Eingabe [%]")
+                ax.set_ylabel("Jährliche Gesamtkosten EAC [€/a]")
+                ax.set_title(f"Tornado-Linien: {case_name}")
+                ax.grid(True)
+                ax.legend(fontsize=8, bbox_to_anchor=(1.01, 1), loc="upper left")
                 fig.tight_layout()
                 show_fig(fig)
 
 with tab_orient:
     ctrl, out = st.columns([1, 3])
     with ctrl:
-        oprof = st.selectbox("Profile", available, key="or_profile")
-        ocase = st.radio("Case", ["PV only", "PV + battery"], key="or_case")
-        obin = st.number_input("Size bin [kWp]", value=1.0, min_value=0.1, step=0.5, key="or_bin")
-        run_or = st.button("Show orientation for profile")
-        run_all = st.button("Optimal allocation: all profiles")
+        oprof = st.selectbox("Lastprofil", available, key="or_profile")
+        ocase = st.radio("Fall", ["Nur PV", "PV + Batterie"], key="or_case")
+        obin = st.number_input("Größenintervall [kWp]", value=1.0, min_value=0.1, step=0.5, key="or_bin")
+        run_or = st.button("Ausrichtung für Lastprofil anzeigen")
+        run_all = st.button("Optimale Verteilung: alle Lastprofile")
     with out:
-        okind = "batt" if ocase == "PV + battery" else "pv"
+        okind = "batt" if ocase == "PV + Batterie" else "pv"
         if run_or:
             odf = get_df(BATT_DIR if okind == "batt" else PV_DIR, oprof, okind)
             if odf is None:
-                st.warning("No RES file for this profile and case.")
+                st.warning("Keine Ergebnisdatei für dieses Lastprofil und diesen Fall.")
             else:
                 render_orientation(odf, okind, oprof, ocase, obin, e)
         if run_all:
@@ -523,20 +618,20 @@ with tab_orient:
 with tab_graph:
     ctrl, out = st.columns([1, 3])
     with ctrl:
-        gkind = st.selectbox("Graphic", ["Allocation: all profiles", "Battery landscape",
-                                         "Orientation scatter"], key="g_kind")
+        gkind = st.selectbox("Grafik", ["Verteilung aller Lastprofile", "Batterie-Landschaft",
+                                        "Ausrichtungsstreuung"], key="g_kind")
         gprof, target, tol = available[0], 8.0, 0.25
-        if gkind != "Allocation: all profiles":
-            gprof = st.selectbox("Profile", available, key="g_profile")
-        if gkind == "Orientation scatter":
-            target = st.number_input("Orientation: total kWp", value=8.0, key="g_target")
-            tol = st.number_input("Tolerance ± kWp", value=0.25, key="g_tol")
-        draw = st.button("Draw")
+        if gkind != "Verteilung aller Lastprofile":
+            gprof = st.selectbox("Lastprofil", available, key="g_profile")
+        if gkind == "Ausrichtungsstreuung":
+            target = st.number_input("Ziel-PV-Leistung [kWp]", value=8.0, key="g_target")
+            tol = st.number_input("Toleranz ± kWp", value=0.25, key="g_tol")
+        draw = st.button("Zeichnen")
     with out:
         descriptions = {
-            "Allocation: all profiles": "Optimal PV per surface and battery size for every load profile, with and without battery.",
-            "Battery landscape": "Annual cost (EAC) for every combination of PV and battery size for the chosen profile. The star marks the optimum.",
-            "Orientation scatter": "Designs near the chosen total PV size: yield, self-consumption, grid feed-in, grid demand and cost against the east/west roof balance. Colour shows the balcony share.",
+            "Verteilung aller Lastprofile": "Optimale PV je Fläche und Batteriegröße für jedes Lastprofil, mit und ohne Batterie.",
+            "Batterie-Landschaft": "Jährliche Kosten (EAC) für jede Kombination aus PV- und Batteriegröße des gewählten Lastprofils. Der Stern markiert das Optimum.",
+            "Ausrichtungsstreuung": "Auslegungen nahe der gewählten Gesamtleistung: Ertrag, Eigenverbrauch, Einspeisung, Netzbezug und Kosten über das Ost-West-Verhältnis der Dächer. Die Farbe zeigt den Balkonanteil.",
         }
         st.caption(descriptions[gkind])
         if draw:
