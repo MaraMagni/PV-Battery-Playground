@@ -142,13 +142,16 @@ def render_main(e, prof):
     for label, kind, df in (("PV only", "pv", pv_df), ("PV + battery", "batt", bt_df)):
         if df is None:
             continue
-        out = evaluate(df, kind, e)
-        outs[kind] = out
-        b = optimum(out)
+        outs[kind] = evaluate(df, kind, e)
+        b = optimum_fast(df, kind, e)
         best[kind] = b
         lines.append(f"{label}: PV {b['kWp']:.2f} kWp | battery {b['kWh']:.1f} kWh | "
                      f"EAC {b['EAC_total']:,.0f} €/y | grid {b['GridDem_kWh']:,.0f} kWh/y | "
                      f"PV subsidy {b['Incentive_PV']:,.0f} € | battery subsidy {b['Incentive_Batt']:,.0f} €")
+        split = ", ".join(f"{lbl} {b[c] * e.eta_pv:.2f} kWp" for c, lbl in SURFACES)
+        roof = b["A_RE"] + b["A_RW"]
+        ow = (b["A_RE"] - b["A_RW"]) / roof if roof > 0 else float("nan")
+        lines.append(f"  Orientation: {split} | roof O/W index {ow:+.2f}")
         note = threshold_note(b["kWp"], e)
         if note:
             lines.append("  WARNING: " + note)
