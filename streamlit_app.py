@@ -438,8 +438,11 @@ with tab_sens:
                 table = sensitivity_1d(df, kind, e, field,
                                        np.linspace(lo / scale, hi / scale, int(steps)))
                 table.insert(0, param, table["value"] * scale)
+                for c, lbl in SURFACES:  # kWp per surface of each optimum
+                    table[f"{lbl} [kWp]"] = table[c] * e.eta_pv
+                surf_cols = [f"{lbl} [kWp]" for _, lbl in SURFACES]
                 show = table[[param, "kWp", "kWh", "EAC_total", "GridDem_kWh",
-                              "Incentive_PV", "Incentive_Batt"]]
+                              "Incentive_PV", "Incentive_Batt"] + surf_cols]
                 st.text(f"{sprof} | {case} | sweep of {param}")
                 st.dataframe(show.round(2), hide_index=True)
                 st.download_button("Save table as CSV",
@@ -460,6 +463,27 @@ with tab_sens:
                 a2.grid(True)
                 fig.tight_layout()
                 show_fig(fig)
+
+                # Optimal PV per surface for each sweep value, stacked like the allocation diagram
+                fig2, ax3 = plt.subplots(figsize=(11, 4.5))
+                x = np.arange(len(table))
+                bottom = np.zeros(len(table))
+                colors = ["#d9776b", "#f5b97f", "#c4c4c4", "#c99473", "#5f5f5f"]
+                for (_, lbl), col in zip(SURFACES, colors):
+                    vals = table[f"{lbl} [kWp]"].to_numpy()
+                    ax3.bar(x, vals, bottom=bottom, color=col, edgecolor="k", lw=0.4,
+                            width=0.7, label=lbl)
+                    bottom += vals
+                ax3.plot(x, table["kWp"].to_numpy(), "k_", ms=22, mew=2, label="Total PV [kWp]")
+                ax3.set_xticks(x)
+                ax3.set_xticklabels([f"{v:.3g}" for v in table[param]], rotation=45, ha="right")
+                ax3.set_xlabel(param)
+                ax3.set_ylabel("Optimal PV per surface [kWp]")
+                ax3.set_title(f"Optimal PV allocation by surface: {sprof} | {case}")
+                ax3.legend(fontsize=8, loc="upper left")
+                ax3.grid(True, axis="y", alpha=0.4)
+                fig2.tight_layout()
+                show_fig(fig2)
 
         if run_tornado:
             results = []
