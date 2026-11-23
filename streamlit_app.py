@@ -281,7 +281,7 @@ def render_all_allocation(kind, case, e):
 
 
 # ---------------------------------------------------------------- report graphics
-def render_graphic(kind_name, prof, e, target, tol, dstart, dload, csv_file, appl_file):
+def render_graphic(kind_name, prof, e, target, tol):
     if kind_name == "Allocation: all profiles":
         parts = [allocation_table({p: (get_df(PV_DIR, p, "pv"), get_df(BATT_DIR, p, "batt"))}, e)
                  for p in available]
@@ -289,8 +289,8 @@ def render_graphic(kind_name, prof, e, target, tol, dstart, dload, csv_file, app
         if t.empty:
             st.warning("No RES files found.")
             return
-        labels = [f"{p}\n{c}" for p, c in zip(t["Profile"], t["Case"])]
         x = np.arange(len(t))
+        profs = list(t["Profile"])
         fig, ax = plt.subplots(figsize=(12, 6))
         bottom = np.zeros(len(t))
         colors = ["#d9776b", "#f5b97f", "#c4c4c4", "#c99473", "#5f5f5f"]
@@ -300,7 +300,18 @@ def render_graphic(kind_name, prof, e, target, tol, dstart, dload, csv_file, app
             bottom += t[lbl].to_numpy()
         ax.set_ylabel("PV [kWp]")
         ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=90, fontsize=7)
+        ax.set_xticklabels(list(t["Case"]), fontsize=8)
+        # Profile name underneath each pair of bars, with a separator between profiles
+        import textwrap
+        starts = [i for i, p in enumerate(profs) if i == 0 or profs[i - 1] != p]
+        ends = starts[1:] + [len(profs)]
+        for s, en in zip(starts, ends):
+            name = textwrap.fill(profs[s].replace("_", " "), 16)
+            ax.text((s + en - 1) / 2, -0.2, name, transform=ax.get_xaxis_transform(),
+                    ha="center", va="top", fontsize=8)
+        for s in starts[1:]:
+            ax.plot([s - 0.5, s - 0.5], [0, -0.22], color="k", lw=0.8,
+                    transform=ax.get_xaxis_transform(), clip_on=False)
         ax.grid(True, axis="y", alpha=0.4)
         ax2 = ax.twinx()
         ax2.bar(x, t["kWh"].to_numpy(), width=0.6, fill=False, linestyle="--", edgecolor="k",
@@ -310,6 +321,7 @@ def render_graphic(kind_name, prof, e, target, tol, dstart, dload, csv_file, app
         h2, l2 = ax2.get_legend_handles_labels()
         ax.legend(h1 + h2, l1 + l2, fontsize=8, ncol=3, loc="upper center")
         fig.tight_layout()
+        fig.subplots_adjust(bottom=0.28)
         show_fig(fig)
         st.dataframe(t.round(2), hide_index=True)
 
@@ -368,34 +380,6 @@ def render_graphic(kind_name, prof, e, target, tol, dstart, dload, csv_file, app
         fig.tight_layout()
         show_fig(fig)
         st.code("Roof-only orientation index; balcony share colour. Rows with no roof are excluded.")
-
-    else:  # Daily PV vs load
-        if csv_file is None or appl_file is None:
-            st.info("Upload the PV time series CSV and Appl.mat to draw this plot.")
-            return
-        df = get_df(PV_DIR, prof, "pv")
-        if df is None:
-            st.warning("No PV-only RES file for this profile.")
-            return
-        pv_series = np.loadtxt(io.BytesIO(csv_file.getvalue()), delimiter=",", ndmin=2)
-        load = load_appl(appl_file.getvalue(), dload)
-        b = optimum_fast(df, "pv", e)
-        areas = {"S": b["A_S"], "RE": b["A_RE"], "RW": b["A_RW"], "RfE": b["A_ReF"], "RfW": b["A_RwF"]}
-        n = 2 * 96  # two days of 15-minute steps
-        d = daily_profile(pv_series, areas, load, int(dstart), n)
-        hours = np.arange(n) * 0.25
-        fig, ax = plt.subplots(figsize=(11, 5))
-        ax.plot(hours, d["pv_kw"], label=f"PV {b['kWp']:.2f} kWp (optimum)")
-        ax.plot(hours, d["load_kw"], "k--", label=f"Load {dload}")
-        ax.set_xlabel("Time [h from start]")
-        ax.set_ylabel("Power [kW]")
-        ax.set_title(f"{prof}: PV vs household load, two days")
-        ax.grid(True)
-        ax.legend()
-        fig.tight_layout()
-        show_fig(fig)
-        st.code(f"Start step {int(dstart)}. Optimum PV {b['kWp']:.2f} kWp, areas m²: " +
-                ", ".join(f"{k} {v:.1f}" for k, v in areas.items()))
 
 
 # ---------------------------------------------------------------- tabs
@@ -499,8 +483,10 @@ with tab_sens:
             for case_name, t, base_opt in results:
                 st.write(f"**{case_name}**: baseline EAC {base_opt['EAC_total']:,.0f} €/y, "
                          f"PV {base_opt['kWp']:.2f} kWp, battery {base_opt['kWh']:.1f} kWh")
-                st.dataframe(t[["Parameter", "Swing [€/y]", "Δ low [€/y]", "Δ high [€/y]",
-                                "kWp low", "kWp high"]].round(1), hide_index=True)
+                cols = ["Parameter", "Swing [€/y]", "Δ low [€/y]", "Δ high [€/y]", "kWp low", "kWp high"]
+                if case_name == "PV + battery":
+                    cols += ["kWh low", "kWh high"]
+                st.dataframe(t[cols].round(1), hide_index=True)
             if results:
                 fig, axes = plt.subplots(1, len(results), figsize=(6 * len(results), 5), squeeze=False)
                 for ax, (case_name, t, _) in zip(axes[0], results):
@@ -538,19 +524,23 @@ with tab_graph:
     ctrl, out = st.columns([1, 3])
     with ctrl:
         gkind = st.selectbox("Graphic", ["Allocation: all profiles", "Battery landscape",
-                                         "Orientation scatter", "Daily PV vs load"], key="g_kind")
-        gprof = st.selectbox("Profile", available, key="g_profile")
-        target = st.number_input("Orientation: total kWp", value=8.0, key="g_target")
-        tol = st.number_input("  tolerance ± kWp", value=0.25, key="g_tol")
-        dstart = st.number_input("Daily: start step (0 = 1 Jan)", value=0, min_value=0, step=1,
-                                 key="g_start")
-        dload = st.text_input("Daily: load profile name", value="Appl", key="g_load")
-        csv_file = st.file_uploader("Daily: PV time series CSV", type="csv", key="g_csv")
-        appl_file = st.file_uploader("Daily: Appl.mat", type="mat", key="g_appl")
+                                         "Orientation scatter"], key="g_kind")
+        gprof, target, tol = available[0], 8.0, 0.25
+        if gkind != "Allocation: all profiles":
+            gprof = st.selectbox("Profile", available, key="g_profile")
+        if gkind == "Orientation scatter":
+            target = st.number_input("Orientation: total kWp", value=8.0, key="g_target")
+            tol = st.number_input("Tolerance ± kWp", value=0.25, key="g_tol")
         draw = st.button("Draw")
     with out:
+        descriptions = {
+            "Allocation: all profiles": "Optimal PV per surface and battery size for every load profile, with and without battery.",
+            "Battery landscape": "Annual cost (EAC) for every combination of PV and battery size for the chosen profile. The star marks the optimum.",
+            "Orientation scatter": "Designs near the chosen total PV size: yield, self-consumption, grid feed-in, grid demand and cost against the east/west roof balance. Colour shows the balcony share.",
+        }
+        st.caption(descriptions[gkind])
         if draw:
             try:
-                render_graphic(gkind, gprof, e, target, tol, dstart, dload, csv_file, appl_file)
+                render_graphic(gkind, gprof, e, target, tol)
             except Exception as ex:
                 st.error(str(ex))
